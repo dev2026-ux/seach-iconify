@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  iconify-server:
+    build: .
+    container_name: iconify-server
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - MAX_CONCURRENT=10
+      - NODE_ENV=production
+    # Descomenta la siguiente línea si quieres usar tu archivo .env local
+    # env_file:
+    #   - .env
