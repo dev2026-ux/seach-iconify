@@ -5,7 +5,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "build": "echo 'No build required for Docker'"
+  },
+  "engines": {
+    "node": ">=22.0.0"
   },
   "keywords": [
     "iconify",
