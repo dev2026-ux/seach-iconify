@@ -51,10 +51,10 @@ RUN groupadd -r nodeuser && useradd -r -g nodeuser -G audio,video nodeuser \
 WORKDIR /usr/src/app
 
 # Copiar archivos de dependencias
-COPY package*.json ./
+COPY package.json package-lock.json ./
 
 # Instalar dependencias
-RUN npm ci --only=production \
+RUN npm ci --omit=dev \
     && npm cache clean --force
 
 # Copiar el código fuente
