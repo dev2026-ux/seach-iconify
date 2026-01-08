@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Instalar dependencias necesarias para Puppeteer (Chromium)
 RUN apt-get update && apt-get install -y \
@@ -38,8 +38,14 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     wget \
     xdg-utils \
+    curl \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
+
+# Crear usuario no-root para seguridad
+RUN groupadd -r nodeuser && useradd -r -g nodeuser -G audio,video nodeuser \
+    && mkdir -p /home/nodeuser/Downloads \
+    && chown -R nodeuser:nodeuser /home/nodeuser
 
 # Crear directorio de trabajo
 WORKDIR /usr/src/app
@@ -47,14 +53,22 @@ WORKDIR /usr/src/app
 # Copiar archivos de dependencias
 COPY package*.json ./
 
-# Instalar dependencias (incluyendo 'puppeteer' que descargará Chromium localmente)
-RUN npm ci --only=production
+# Instalar dependencias
+RUN npm ci --only=production \
+    && npm cache clean --force
 
 # Copiar el código fuente
-COPY . .
+COPY --chown=nodeuser:nodeuser . .
+
+# Cambiar a usuario no-root
+USER nodeuser
 
 # Exponer el puerto
 EXPOSE 3000
 
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
 # Comando para iniciar la aplicación
-CMD [ "npm", "start" ]
+CMD [ "node", "server.js" ]
