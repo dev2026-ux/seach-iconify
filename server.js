@@ -7,6 +7,8 @@ require('dotenv').config();
 const app = express();
 const PORT = process?.env?.PORT || 3000;
 const MAX_CONCURRENT = process?.env?.MAX_CONCURRENT || 10;
+const MAX_CACHE_SIZE = process?.env?.MAX_CACHE_SIZE || 1000;
+const MAX_MEMORY_MB = process?.env?.MAX_MEMORY_MB || 450; // Límite antes de reiniciar
 
 // Middleware
 app.use(cors());
@@ -28,7 +30,9 @@ let stats = {
   cacheHits: 0,
   cacheMisses: 0,
   activeRequests: 0,
-  errors: 0
+  errors: 0,
+  cacheEvictions: 0, // Entradas eliminadas por límite
+  cacheCleanups: 0   // Limpiezas automáticas ejecutadas
 };
 
 // Inicializar navegador y página permanente
@@ -47,7 +51,7 @@ async function initBrowserAndPage() {
   if (!browser) {
     console.log('🚀 Iniciando Puppeteer...');
     browser = await puppeteer.launch({
-      headless: 'new',
+      headless: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -62,11 +66,16 @@ async function initBrowserAndPage() {
     console.log('📄 Creando página permanente de Iconify...');
     iconifyPage = await browser.newPage();
 
-    // Bloquear recursos innecesarios
+    // Bloquear TODOS los recursos innecesarios (máxima optimización)
     await iconifyPage.setRequestInterception(true);
     iconifyPage.on('request', (req) => {
       const resourceType = req.resourceType();
-      if (['image', 'font', 'stylesheet', 'media'].includes(resourceType)) {
+      const url = req.url();
+
+      // Solo permitir el fetch a la API de Iconify
+      if (url.includes('api.iconify.design/search')) {
+        req.continue();
+      } else if (['image', 'font', 'stylesheet', 'media', 'texttrack', 'eventsource', 'websocket', 'manifest', 'other'].includes(resourceType)) {
         req.abort();
       } else {
         req.continue();
@@ -147,11 +156,8 @@ async function searchIconify(query, limit = 999) {
       throw new Error(data.error);
     }
 
-    // Guardar en caché
-    cache.set(cacheKey, {
-      data,
-      timestamp: Date.now()
-    });
+    // Guardar en caché con límite
+    addToCache(cacheKey, data);
 
     console.log(`✅ [SUCCESS] "${query}" - Total: ${data.total || 0}`);
     return data;
@@ -164,6 +170,66 @@ async function searchIconify(query, limit = 999) {
     stats.activeRequests--;
   }
 }
+
+// Función para agregar al caché con límite
+function addToCache(key, data) {
+  // Si el caché está lleno, eliminar la entrada más antigua (FIFO)
+  if (cache.size >= MAX_CACHE_SIZE) {
+    const firstKey = cache.keys().next().value;
+    cache.delete(firstKey);
+    stats.cacheEvictions++;
+    console.log(`🗑️ Caché lleno (${MAX_CACHE_SIZE}), eliminando: ${firstKey}`);
+  }
+
+  cache.set(key, {
+    data,
+    timestamp: Date.now()
+  });
+}
+
+// Limpieza automática de caché expirado
+function cleanExpiredCache() {
+  const now = Date.now();
+  let cleaned = 0;
+
+  for (const [key, value] of cache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      cache.delete(key);
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) {
+    stats.cacheCleanups++;
+    console.log(`🧹 Limpieza automática: ${cleaned} entradas expiradas eliminadas`);
+  }
+
+  return cleaned;
+}
+
+// Ejecutar limpieza cada 2 minutos
+setInterval(cleanExpiredCache, 1000 * 60 * 2);
+
+// Monitoreo de memoria cada minuto
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(2);
+  const rssMB = (mem.rss / 1024 / 1024).toFixed(2);
+
+  console.log(`📊 Memoria - Heap: ${heapMB} MB | RSS: ${rssMB} MB | Caché: ${cache.size}/${MAX_CACHE_SIZE}`);
+
+  // Alerta si supera el 80% del límite
+  const warningThreshold = MAX_MEMORY_MB * 0.8;
+  if (mem.heapUsed / 1024 / 1024 > warningThreshold) {
+    console.warn(`⚠️ ALERTA: Heap alto (${heapMB} MB / ${MAX_MEMORY_MB} MB límite)`);
+  }
+
+  // Reinicio automático si supera el límite
+  if (mem.heapUsed / 1024 / 1024 > MAX_MEMORY_MB) {
+    console.error(`💥 MEMORIA CRÍTICA (${heapMB} MB > ${MAX_MEMORY_MB} MB) - Reiniciando...`);
+    process.exit(1); // PM2/Docker/Easypanel lo reiniciará automáticamente
+  }
+}, 60000);
 
 // RUTAS DE LA API
 
@@ -246,9 +312,84 @@ app.get('/api/stats', (req, res) => {
     },
     config: {
       maxConcurrent: MAX_CONCURRENT,
+      maxCacheSize: MAX_CACHE_SIZE,
+      maxMemoryMB: MAX_MEMORY_MB,
       cacheTTL: CACHE_TTL / 1000 + 's',
       port: PORT
     },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Diagnóstico de memoria con sugerencias
+app.get('/api/memory-health', (req, res) => {
+  const mem = process.memoryUsage();
+  const heapMB = mem.heapUsed / 1024 / 1024;
+  const rssMB = mem.rss / 1024 / 1024;
+  const heapPercent = (heapMB / MAX_MEMORY_MB) * 100;
+
+  let status = 'healthy';
+  let alerts = [];
+  let suggestions = [];
+
+  // Análisis de salud
+  if (heapPercent > 90) {
+    status = 'critical';
+    alerts.push(`Memoria crítica: ${heapMB.toFixed(2)} MB (${heapPercent.toFixed(1)}% del límite)`);
+    suggestions.push('ACCIÓN INMEDIATA: El servidor se reiniciará pronto');
+    suggestions.push('Aumentar MAX_MEMORY_MB en variables de entorno');
+    suggestions.push('Reducir MAX_CACHE_SIZE si el caché está lleno');
+  } else if (heapPercent > 80) {
+    status = 'warning';
+    alerts.push(`Memoria alta: ${heapMB.toFixed(2)} MB (${heapPercent.toFixed(1)}% del límite)`);
+    suggestions.push('Considerar limpiar caché manualmente: DELETE /api/cache');
+    suggestions.push('Monitorear crecimiento en los próximos minutos');
+  } else if (heapPercent > 60) {
+    status = 'moderate';
+    alerts.push(`Uso moderado: ${heapMB.toFixed(2)} MB (${heapPercent.toFixed(1)}% del límite)`);
+  }
+
+  // Análisis de caché
+  const cachePercent = (cache.size / MAX_CACHE_SIZE) * 100;
+  if (cachePercent > 90) {
+    alerts.push(`Caché casi lleno: ${cache.size}/${MAX_CACHE_SIZE} (${cachePercent.toFixed(1)}%)`);
+    suggestions.push('El caché está eliminando entradas automáticamente (FIFO)');
+  }
+
+  // Análisis de evictions
+  if (stats.cacheEvictions > 100) {
+    alerts.push(`Alto número de evictions: ${stats.cacheEvictions}`);
+    suggestions.push('Considerar aumentar MAX_CACHE_SIZE para mejor rendimiento');
+  }
+
+  // Estimación de capacidad
+  const avgMemoryPerRequest = cache.size > 0 ? heapMB / cache.size : 0;
+  const estimatedCapacity = avgMemoryPerRequest > 0 ? Math.floor(MAX_MEMORY_MB / avgMemoryPerRequest) : 'N/A';
+
+  res.json({
+    status,
+    health: {
+      heapUsedMB: parseFloat(heapMB.toFixed(2)),
+      heapLimitMB: MAX_MEMORY_MB,
+      heapPercent: parseFloat(heapPercent.toFixed(2)),
+      rssMB: parseFloat(rssMB.toFixed(2)),
+      uptimeHours: parseFloat((process.uptime() / 3600).toFixed(2))
+    },
+    cache: {
+      size: cache.size,
+      limit: MAX_CACHE_SIZE,
+      percent: parseFloat(cachePercent.toFixed(2)),
+      evictions: stats.cacheEvictions,
+      cleanups: stats.cacheCleanups
+    },
+    performance: {
+      totalRequests: stats.totalRequests,
+      cacheHitRate: stats.totalRequests > 0 ? parseFloat(((stats.cacheHits / stats.totalRequests) * 100).toFixed(2)) : 0,
+      avgMemoryPerCacheEntry: cache.size > 0 ? parseFloat((heapMB / cache.size).toFixed(3)) : 0,
+      estimatedMaxCacheEntries: estimatedCapacity
+    },
+    alerts,
+    suggestions,
     timestamp: new Date().toISOString()
   });
 });
