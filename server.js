@@ -5,6 +5,7 @@ const { default: PQueue } = require('p-queue');
 require('dotenv').config();
 
 const app = express();
+const HEADLESS = process?.env?.HEADLESS || 'new';
 const PORT = process?.env?.PORT || 3000;
 const MAX_CONCURRENT = process?.env?.MAX_CONCURRENT || 10;
 const MAX_CACHE_SIZE = process?.env?.MAX_CACHE_SIZE || 1000;
@@ -51,7 +52,7 @@ async function initBrowserAndPage() {
   if (!browser) {
     console.log('🚀 Iniciando Puppeteer...');
     browser = await puppeteer.launch({
-      headless: false,
+      headless: HEADLESS,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
